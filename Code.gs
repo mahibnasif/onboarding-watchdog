@@ -60,6 +60,9 @@ var CONFIG = {
   // the trigger dying mid-way against the execution time limit.
   MAX_ROWS_PER_EDIT: 25,
 
+  // Hour of day (0-23, script timezone) the daily check runs.
+  DAILY_CHECK_HOUR: 7,
+
   // Branding used in the email template.
   COMPANY_NAME: 'Bright Path Therapy',
   ONBOARDING_CONTACT: 'onboarding@brightpaththerapy.example'
@@ -1091,4 +1094,149 @@ function getLastHeartbeat() {
   }
   var value = sheet.getRange(sheet.getLastRow(), 1).getValue();
   return (value instanceof Date) ? value : null;
+}
+
+/* =========================================================================
+ * 7. Trigger installation + menu
+ * ========================================================================= */
+
+/** Functions this script installs triggers for. */
+var MANAGED_TRIGGER_HANDLERS = ['onEdit', 'dailyHealthCheck'];
+
+/**
+ * Creates both triggers. Run this once after deploying, from the account that
+ * should appear as the sender — installable triggers run as whoever created
+ * them, and that account's Gmail quota is the one consumed.
+ *
+ * Idempotent: existing triggers for these handlers are removed first, so
+ * running it twice does not double up (which would double-send).
+ *
+ * @return {string} Human-readable result, shown by the menu.
+ */
+function installTriggers() {
+  var removed = uninstallTriggers();
+  var spreadsheet = SpreadsheetApp.getActive();
+
+  // The installable edit trigger. Required — see the comment on onEdit for
+  // why the simple trigger cannot do this job.
+  ScriptApp.newTrigger('onEdit')
+    .forSpreadsheet(spreadsheet)
+    .onEdit()
+    .create();
+
+  ScriptApp.newTrigger('dailyHealthCheck')
+    .timeBased()
+    .everyDays(1)
+    .atHour(Number(getSetting_('DAILY_CHECK_HOUR')))
+    .create();
+
+  // Provision the log tabs now so a reviewer can see the structure without
+  // waiting for the first failure or the first daily run.
+  getOrCreateSheet_(getSetting_('ERROR_LOG_SHEET_NAME'), ERROR_LOG_HEADERS);
+  getOrCreateSheet_(getSetting_('HEALTH_SHEET_NAME'), HEALTH_HEADERS);
+
+  var message = 'Installed the edit trigger and the daily check (runs at ' +
+    getSetting_('DAILY_CHECK_HOUR') + ':00 ' + Session.getScriptTimeZone() +
+    '). Removed ' + removed + ' pre-existing trigger(s). Sends will come from ' +
+    Session.getEffectiveUser().getEmail() + '.';
+  console.log(message);
+  return message;
+}
+
+/**
+ * Removes every trigger this script manages. Used by installTriggers to stay
+ * idempotent, and exposed on the menu for decommissioning.
+ *
+ * @return {number} How many triggers were deleted.
+ */
+function uninstallTriggers() {
+  var triggers = ScriptApp.getProjectTriggers();
+  var removed = 0;
+  for (var i = 0; i < triggers.length; i++) {
+    if (MANAGED_TRIGGER_HANDLERS.indexOf(triggers[i].getHandlerFunction()) !== -1) {
+      ScriptApp.deleteTrigger(triggers[i]);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/**
+ * Adds an "Onboarding" menu when the spreadsheet opens, so an admin can run
+ * setup and diagnostics without opening the script editor.
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Onboarding')
+    .addItem('Install / re-install triggers', 'menuInstallTriggers')
+    .addItem('Run daily check now', 'menuRunDailyCheck')
+    .addItem('Show system status', 'menuShowStatus')
+    .addSeparator()
+    .addItem('Remove triggers (stop automation)', 'menuUninstallTriggers')
+    .addToUi();
+}
+
+/** Menu wrapper: installs triggers and reports the result. */
+function menuInstallTriggers() {
+  SpreadsheetApp.getUi().alert('Onboarding automation', installTriggers(),
+    SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/** Menu wrapper: removes triggers and reports the count. */
+function menuUninstallTriggers() {
+  var removed = uninstallTriggers();
+  SpreadsheetApp.getUi().alert('Onboarding automation',
+    'Removed ' + removed + ' trigger(s). The automation is now off; rows set ' +
+    'to "New" will no longer be emailed.',
+    SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/** Menu wrapper: runs the daily check on demand and summarizes the result. */
+function menuRunDailyCheck() {
+  var summary = dailyHealthCheck();
+  SpreadsheetApp.getUi().alert('Daily check',
+    (summary.ok ? 'Completed.' : 'FAILED — see the Error Log tab.') +
+    '\n\nRows scanned: ' + summary.scanned +
+    '\nStuck rows: ' + summary.stuck +
+    '\nAdmin alert sent: ' + (summary.alertSent ? 'yes' : 'no') +
+    '\nRemaining Gmail quota: ' +
+    (summary.remainingQuota === null ? 'unknown' : summary.remainingQuota),
+    SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * Menu wrapper: the at-a-glance "is this thing on?" view — which triggers
+ * exist, who they run as, and how long ago the last heartbeat was.
+ */
+function menuShowStatus() {
+  var triggers = ScriptApp.getProjectTriggers();
+  var hasEdit = false;
+  var hasDaily = false;
+  for (var i = 0; i < triggers.length; i++) {
+    var handler = triggers[i].getHandlerFunction();
+    if (handler === 'onEdit') {
+      hasEdit = true;
+    }
+    if (handler === 'dailyHealthCheck') {
+      hasDaily = true;
+    }
+  }
+
+  var heartbeat = getLastHeartbeat();
+  var heartbeatLine;
+  if (!heartbeat) {
+    heartbeatLine = 'never (the daily check has not completed yet)';
+  } else {
+    var ageMs = new Date().getTime() - heartbeat.getTime();
+    heartbeatLine = formatTimestamp_(heartbeat) + '  (' + formatAge_(ageMs) +
+      ' ago)' + (ageMs > 36 * 60 * 60 * 1000 ? '  <-- STALE' : '');
+  }
+
+  SpreadsheetApp.getUi().alert('Onboarding automation status',
+    'Edit trigger installed: ' + (hasEdit ? 'yes' : 'NO — run Install') +
+    '\nDaily check installed: ' + (hasDaily ? 'yes' : 'NO — run Install') +
+    '\nRuns as: ' + Session.getEffectiveUser().getEmail() +
+    '\nAlerts go to: ' + getSetting_('ADMIN_EMAIL') +
+    '\nLast heartbeat: ' + heartbeatLine,
+    SpreadsheetApp.getUi().ButtonSet.OK);
 }
