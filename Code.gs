@@ -720,6 +720,11 @@ function dailyHealthCheck() {
     }
 
     summary.ok = true;
+
+    // Only a fully successful run leaves a heartbeat. A run that threw is
+    // reported by email instead, and deliberately leaves a gap in the health
+    // log so the absence is itself visible.
+    recordHeartbeat_(summary);
     return summary;
   } catch (err) {
     // The checker itself failed. Log it, and try to shout about it — a broken
@@ -999,4 +1004,91 @@ function postToSlack_(text) {
   } catch (err) {
     console.warn('Slack webhook call failed: ' + err);
   }
+}
+
+/* =========================================================================
+ * 6. Heartbeat / System Health
+ * ========================================================================= */
+
+/** Header row for the System Health tab, created on first use. */
+var HEALTH_HEADERS = [
+  'Timestamp', 'Rows Scanned', 'Stuck Rows', 'Alert Sent',
+  'Remaining Gmail Quota', 'Duration (s)'
+];
+
+/**
+ * Appends one heartbeat row to the System Health tab.
+ *
+ * The value of this tab is not what it contains but that it keeps growing.
+ * The alert in section 5 can only fire while the script is still running at
+ * all; it cannot report that the script has stopped running. If someone
+ * revokes the script's authorization, deletes the trigger, or the owning
+ * account is suspended, no code of ours executes and no alert is sent — the
+ * automation fails completely and silently.
+ *
+ * A daily row here turns that into something observable: if the newest
+ * timestamp in this tab is more than about a day old, the automation is dead,
+ * regardless of what the roster looks like. That check is a human glance or an
+ * external monitor — deliberately outside this script, since a script cannot
+ * be trusted to report its own non-execution.
+ *
+ * Never throws: a failed heartbeat write must not turn a successful check into
+ * a reported failure.
+ *
+ * @param {!Object} summary Run summary from dailyHealthCheck.
+ */
+function recordHeartbeat_(summary) {
+  try {
+    var sheet = getOrCreateSheet_(
+      getSetting_('HEALTH_SHEET_NAME'), HEALTH_HEADERS);
+
+    var finishedAt = new Date();
+    var durationSeconds =
+      (finishedAt.getTime() - summary.startedAt.getTime()) / 1000;
+
+    sheet.appendRow([
+      finishedAt,
+      summary.scanned,
+      summary.stuck,
+      summary.alertSent ? 'Yes' : 'No',
+      summary.remainingQuota === null ? 'unknown' : summary.remainingQuota,
+      Math.round(durationSeconds * 10) / 10
+    ]);
+
+    trimHealthLog_(sheet);
+  } catch (err) {
+    console.error('Could not write the heartbeat row: ' + err);
+  }
+}
+
+/**
+ * Drops the oldest heartbeat rows once the tab exceeds HEALTH_LOG_MAX_ROWS.
+ * A daily append is slow growth, but the tab should not outlive the
+ * spreadsheet's cell limit.
+ *
+ * @param {!GoogleAppsScript.Spreadsheet.Sheet} sheet System Health sheet.
+ */
+function trimHealthLog_(sheet) {
+  var dataRows = sheet.getLastRow() - 1;
+  var max = Number(getSetting_('HEALTH_LOG_MAX_ROWS'));
+  if (dataRows > max) {
+    // Row 1 is headers, so the oldest data starts at row 2.
+    sheet.deleteRows(2, dataRows - max);
+  }
+}
+
+/**
+ * Reads the most recent heartbeat timestamp. Exposed so an admin (or an
+ * external monitor calling into the spreadsheet) can ask "when did this last
+ * run?" without scrolling the tab.
+ *
+ * @return {?Date} Latest heartbeat, or null if there has never been one.
+ */
+function getLastHeartbeat() {
+  var sheet = getSheet_(getSetting_('HEALTH_SHEET_NAME'));
+  if (!sheet || sheet.getLastRow() < 2) {
+    return null;
+  }
+  var value = sheet.getRange(sheet.getLastRow(), 1).getValue();
+  return (value instanceof Date) ? value : null;
 }
