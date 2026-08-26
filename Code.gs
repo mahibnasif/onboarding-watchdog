@@ -474,6 +474,15 @@ function sendWelcomeForRow_(sheet, headerMap, rowNumber) {
     // execution waiting on it reads "Emailed" and not a stale "New".
     SpreadsheetApp.flush();
     return 'sent';
+  } catch (err) {
+    // Any failure — validation, quota, a Gmail hiccup — lands here. The row
+    // is parked in "Error" so it is visible in the sheet and picked up by the
+    // daily scan, and the details go to the Error Log tab. We deliberately do
+    // not rethrow: one bad row must not abort the other rows in this edit.
+    markRowError_(sheet, headerMap, rowNumber);
+    logError_(rowNumber, err, row ? row.email : '');
+    SpreadsheetApp.flush();
+    return 'failed';
   } finally {
     lock.releaseLock();
   }
@@ -572,4 +581,79 @@ function markRowEmailed_(sheet, headerMap, rowNumber, when) {
     .setValue(STATUS.EMAILED);
   sheet.getRange(rowNumber, requireColumn_(headerMap, COLUMNS.SENT_AT))
     .setValue(when);
+}
+
+/* =========================================================================
+ * 4. Error logging
+ * ========================================================================= */
+
+/** Header row for the Error Log tab, created on first use. */
+var ERROR_LOG_HEADERS = [
+  'Timestamp', 'Row', 'Therapist Email', 'Error Message', 'Details'
+];
+
+/**
+ * Parks a row in "Error" status so the failure is visible in the sheet itself,
+ * not only in a log tab nobody opens.
+ *
+ * Note the Email Sent Timestamp is left blank on purpose: an errored row has
+ * not been emailed, and leaving it empty means a retry (setting Status back to
+ * "New") is not blocked by the already-sent guard.
+ *
+ * Deliberately tolerant — this runs from a catch block, and a throw here would
+ * mask the original error.
+ *
+ * @param {!GoogleAppsScript.Spreadsheet.Sheet} sheet Roster sheet.
+ * @param {!Object<string, number>} headerMap From getHeaderMap_.
+ * @param {number} rowNumber 1-based sheet row.
+ */
+function markRowError_(sheet, headerMap, rowNumber) {
+  try {
+    var statusColumn = headerMap[normalizeKey_(COLUMNS.STATUS)];
+    if (statusColumn) {
+      sheet.getRange(rowNumber, statusColumn).setValue(STATUS.ERROR);
+    }
+  } catch (err) {
+    console.error(
+      'Could not set Error status on row ' + rowNumber + ': ' + err);
+  }
+}
+
+/**
+ * Appends one failure to the Error Log tab, creating the tab if needed.
+ *
+ * Like markRowError_, this must never throw. It is the last link in the chain:
+ * if logging the error also threw, the failure would vanish entirely, which is
+ * the silent-failure mode this whole project exists to prevent. A failure here
+ * falls back to console.error, which is still visible in the Apps Script
+ * execution log.
+ *
+ * @param {number} rowNumber Roster row the failure relates to.
+ * @param {*} error The caught exception.
+ * @param {string=} email Address involved, when known — useful context.
+ */
+function logError_(rowNumber, error, email) {
+  var message = (error && error.message) ? error.message : String(error);
+  var details = (error && error.stack) ? String(error.stack) : '';
+
+  try {
+    var sheet = getOrCreateSheet_(
+      getSetting_('ERROR_LOG_SHEET_NAME'), ERROR_LOG_HEADERS);
+    sheet.appendRow([
+      new Date(),
+      rowNumber,
+      email || '',
+      message,
+      // Stack traces can be long; the cell limit is 50k characters.
+      details.slice(0, 4000)
+    ]);
+  } catch (err) {
+    console.error(
+      'Failed to write to the Error Log tab (' + err + '). Original error on ' +
+      'row ' + rowNumber + ': ' + message);
+  }
+
+  // Always mirror to the execution log so Stackdriver has the full picture
+  // even when the spreadsheet write succeeded.
+  console.error('Row ' + rowNumber + ': ' + message);
 }
