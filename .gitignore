@@ -1,0 +1,17 @@
+# clasp (Apps Script CLI) local state — contains the private script ID
+.clasp.json
+.clasprc.json
+
+# Local secrets. Runtime config lives in Script Properties, never in the repo.
+.env
+.env.*
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# Only present if someone adds tooling later; the script itself has no deps.
+node_modules/
