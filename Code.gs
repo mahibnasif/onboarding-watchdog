@@ -55,6 +55,11 @@ var CONFIG = {
   // Keep the health log from growing without bound.
   HEALTH_LOG_MAX_ROWS: 400,
 
+  // Most rows one edit event will process. A bulk paste of more than this
+  // leaves the remainder in "New"; the daily scan then flags them rather than
+  // the trigger dying mid-way against the execution time limit.
+  MAX_ROWS_PER_EDIT: 25,
+
   // Branding used in the email template.
   COMPANY_NAME: 'Bright Path Therapy',
   ONBOARDING_CONTACT: 'onboarding@brightpaththerapy.example'
@@ -290,4 +295,281 @@ function formatStartDate_(value) {
 function formatTimestamp_(date) {
   return Utilities.formatDate(
     date, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss z');
+}
+
+/* =========================================================================
+ * 3. onEdit path — send the welcome email
+ * ========================================================================= */
+
+/**
+ * Edit entry point.
+ *
+ * IMPORTANT — this must be installed as an *installable* trigger (run
+ * `installTriggers` once, or use the Onboarding menu). A function named
+ * onEdit also runs automatically as a simple trigger, and simple triggers
+ * execute without authorization, so they are not permitted to call MailApp at
+ * all. Google fires both, so we tell them apart and let the simple one fall
+ * straight through: only installable trigger events carry `triggerUid`.
+ *
+ * Without that check the simple invocation would throw a permissions error on
+ * every single edit and bury the real executions in noise.
+ *
+ * @param {!Object} e Edit event object supplied by Apps Script.
+ */
+function onEdit(e) {
+  if (!e || !e.range) {
+    return;
+  }
+  if (!e.triggerUid) {
+    // Simple-trigger invocation: unauthorized for MailApp. The installable
+    // trigger handles this same edit a moment later.
+    return;
+  }
+  handleRosterEdit_(e);
+}
+
+/**
+ * Decides whether an edit is one we care about, and processes the rows it
+ * touched.
+ *
+ * We act only when the edited range overlaps the Status column, which covers
+ * both ways a row becomes actionable: a recruiter typing "New" into Status,
+ * and a whole row being pasted in with Status already filled.
+ *
+ * @param {!Object} e Edit event object.
+ */
+function handleRosterEdit_(e) {
+  var sheet = e.range.getSheet();
+  if (sheet.getName() !== getSetting_('ROSTER_SHEET_NAME')) {
+    return;
+  }
+
+  var headerMap = getHeaderMap_(sheet);
+  var statusColumn = headerMap[normalizeKey_(COLUMNS.STATUS)];
+  if (!statusColumn) {
+    // No Status column means this is not the roster we expect. Stay quiet
+    // rather than throwing on every edit to an unrelated sheet.
+    return;
+  }
+
+  // Did this edit touch the Status column at all?
+  var firstColumn = e.range.getColumn();
+  var lastColumn = firstColumn + e.range.getNumColumns() - 1;
+  if (statusColumn < firstColumn || statusColumn > lastColumn) {
+    return;
+  }
+
+  var firstRow = e.range.getRow();
+  var rowCount = e.range.getNumRows();
+
+  for (var offset = 0; offset < rowCount; offset++) {
+    var rowNumber = firstRow + offset;
+
+    // Row 1 is headers.
+    if (rowNumber < 2) {
+      continue;
+    }
+    if (offset >= CONFIG.MAX_ROWS_PER_EDIT) {
+      // Remaining rows keep Status "New" and are picked up by the daily scan.
+      console.warn(
+        'Edit touched more than ' + CONFIG.MAX_ROWS_PER_EDIT + ' rows; ' +
+        'stopping at row ' + rowNumber + '. Remaining rows will be reported ' +
+        'by the daily stuck-row check.');
+      break;
+    }
+
+    // Cheap pre-filter outside the lock. The authoritative check happens
+    // again inside sendWelcomeForRow_ once we actually hold the lock.
+    var status = canonicalStatus_(sheet.getRange(rowNumber, statusColumn).getValue());
+    if (status !== STATUS.NEW) {
+      continue;
+    }
+
+    sendWelcomeForRow_(sheet, headerMap, rowNumber);
+  }
+}
+
+/**
+ * Sends the welcome email for one row, then marks it Emailed.
+ *
+ * Concurrency is the real hazard here. Several people edit this sheet at once,
+ * and two edits to the same row can have their trigger executions overlap. So:
+ *
+ *   1. Take a document-scoped lock (spreadsheet-wide, across all users).
+ *   2. Re-read Status *inside* the lock and bail if it is no longer "New".
+ *   3. Send, write Status + timestamp, then flush before releasing.
+ *
+ * Step 2 is what makes this idempotent: whoever loses the race sees "Emailed"
+ * and skips instead of sending a second copy. Step 3 makes sure that write is
+ * committed and visible before the next contender is allowed in.
+ *
+ * @param {!GoogleAppsScript.Spreadsheet.Sheet} sheet Roster sheet.
+ * @param {!Object<string, number>} headerMap From getHeaderMap_.
+ * @param {number} rowNumber 1-based sheet row.
+ * @return {string} 'sent' or 'skipped'.
+ */
+function sendWelcomeForRow_(sheet, headerMap, rowNumber) {
+  var lock = LockService.getDocumentLock();
+  if (!lock.tryLock(CONFIG.LOCK_TIMEOUT_MS)) {
+    // Someone else holds the lock. Their execution is handling this row, or
+    // the row stays "New" and the daily scan reports it. Never send without
+    // the lock — that is exactly how duplicates happen.
+    console.warn('Could not acquire lock for row ' + rowNumber + '; skipping.');
+    return 'skipped';
+  }
+
+  try {
+    // Authoritative re-read. The values in the edit event may already be
+    // stale by the time we get here.
+    var row = readRosterRow_(sheet, headerMap, rowNumber);
+
+    // --- Idempotency gate -------------------------------------------------
+    if (row.status === STATUS.EMAILED) {
+      return 'skipped';
+    }
+    if (row.status !== STATUS.NEW) {
+      return 'skipped';
+    }
+    if (row.sentAt) {
+      // Belt and braces: a send timestamp means mail already went out, even
+      // if the Status cell was hand-edited back to "New" afterwards.
+      return 'skipped';
+    }
+
+    // --- Validation -------------------------------------------------------
+    if (!row.email) {
+      throw new Error('Email column is empty.');
+    }
+    if (!isValidEmail_(row.email)) {
+      throw new Error('Malformed email address: "' + row.email + '"');
+    }
+    if (!row.name) {
+      throw new Error('Name column is empty.');
+    }
+
+    // Refuse to start a send we cannot finish. Hitting the quota mid-run
+    // throws an opaque error; checking first produces a message an admin can
+    // act on.
+    var remaining = MailApp.getRemainingDailyQuota();
+    if (remaining < CONFIG.MIN_QUOTA_BUFFER) {
+      throw new Error(
+        'Gmail daily send quota nearly exhausted (' + remaining +
+        ' remaining). Not sending; retry after the quota resets.');
+    }
+
+    // --- Send -------------------------------------------------------------
+    var message = buildWelcomeEmail_(row);
+    MailApp.sendEmail({
+      to: row.email,
+      subject: message.subject,
+      body: message.body,
+      htmlBody: message.htmlBody,
+      name: getSetting_('COMPANY_NAME'),
+      replyTo: getSetting_('ONBOARDING_CONTACT')
+    });
+
+    markRowEmailed_(sheet, headerMap, rowNumber, new Date());
+
+    // Commit the status write before releasing the lock, so a concurrent
+    // execution waiting on it reads "Emailed" and not a stale "New".
+    SpreadsheetApp.flush();
+    return 'sent';
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Builds the welcome email from a row. Kept as a pure function of the row so
+ * the wording can be reviewed and changed without touching send logic.
+ *
+ * @param {!Object} row From readRosterRow_.
+ * @return {{subject: string, body: string, htmlBody: string}}
+ */
+function buildWelcomeEmail_(row) {
+  var company = getSetting_('COMPANY_NAME');
+  var contact = getSetting_('ONBOARDING_CONTACT');
+  var startDate = formatStartDate_(row.startDate);
+
+  // First name only reads warmer than the full legal name in the sheet.
+  var firstName = row.name.split(/\s+/)[0];
+
+  var startLine = startDate
+    ? 'Your first day is ' + startDate + '.'
+    : 'We will confirm your start date shortly.';
+
+  var subject = 'Welcome to ' + company + ', ' + firstName + '!';
+
+  var body = [
+    'Hi ' + firstName + ',',
+    '',
+    'Welcome to ' + company + '. We are glad to have you joining the clinical team.',
+    '',
+    startLine,
+    '',
+    'Before then, a few things to expect:',
+    '  - Your onboarding packet and credentialing paperwork, sent separately.',
+    '  - Access to the scheduling and EHR systems, set up in your first week.',
+    '  - An introduction to your supervising clinician.',
+    '',
+    'If anything above looks wrong, or your start date has changed, just reply',
+    'to this message and we will sort it out.',
+    '',
+    'Warmly,',
+    'The ' + company + ' Onboarding Team',
+    contact
+  ].join('\n');
+
+  var htmlBody = [
+    '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.6;color:#222;">',
+    '<p>Hi ' + escapeHtml_(firstName) + ',</p>',
+    '<p>Welcome to ' + escapeHtml_(company) + '. We are glad to have you joining the clinical team.</p>',
+    '<p><strong>' + escapeHtml_(startLine) + '</strong></p>',
+    '<p>Before then, a few things to expect:</p>',
+    '<ul>',
+    '<li>Your onboarding packet and credentialing paperwork, sent separately.</li>',
+    '<li>Access to the scheduling and EHR systems, set up in your first week.</li>',
+    '<li>An introduction to your supervising clinician.</li>',
+    '</ul>',
+    '<p>If anything above looks wrong, or your start date has changed, just reply ',
+    'to this message and we will sort it out.</p>',
+    '<p>Warmly,<br>The ' + escapeHtml_(company) + ' Onboarding Team<br>',
+    '<a href="mailto:' + encodeURI(contact) + '">' + escapeHtml_(contact) + '</a></p>',
+    '</div>'
+  ].join('');
+
+  return {subject: subject, body: body, htmlBody: htmlBody};
+}
+
+/**
+ * Escapes text interpolated into the HTML email body. Names come from a sheet
+ * that many people can type into, so treat them as untrusted input rather than
+ * letting a stray angle bracket break the markup.
+ *
+ * @param {string} text Raw text.
+ * @return {string} HTML-escaped text.
+ */
+function escapeHtml_(text) {
+  return String(text === null || text === undefined ? '' : text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * Marks a row as successfully emailed: Status becomes "Emailed" and the
+ * Email Sent Timestamp column is stamped. Together these are what later runs
+ * read to decide the row is already done.
+ *
+ * @param {!GoogleAppsScript.Spreadsheet.Sheet} sheet Roster sheet.
+ * @param {!Object<string, number>} headerMap From getHeaderMap_.
+ * @param {number} rowNumber 1-based sheet row.
+ * @param {!Date} when Send time.
+ */
+function markRowEmailed_(sheet, headerMap, rowNumber, when) {
+  sheet.getRange(rowNumber, requireColumn_(headerMap, COLUMNS.STATUS))
+    .setValue(STATUS.EMAILED);
+  sheet.getRange(rowNumber, requireColumn_(headerMap, COLUMNS.SENT_AT))
+    .setValue(when);
 }
